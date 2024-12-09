@@ -1,19 +1,21 @@
-/*
-CONTROL PID
-ANTIWINDUP
-FILTRO PASA BAJAS (EN DERIVADOR) - FEEDBACK LOOP CON INTEGRADOR EN EL FEEDBACK
-*/
-
-#include <LoRa.h>
 #include <SPI.h>
-#include <PID_v1.h>
+#include <LoRa.h>
 #include <ESP32Servo.h>
 #include <Adafruit_BMP085.h>
 #include "MPU9250.h"
-#include "BluetoothSerial.h"
 
-#define IS_BLUETOOTH 1
-#define DEBUG 1
+#define IS_BLUETOOTH 0
+#define DEBUG 0
+
+#if IS_BLUETOOTH == 1
+  #include "BluetoothSerial.h"
+
+  /* Bluetooth */
+  constexpr uint16_t timeInterval = 100;
+  constexpr char *ESP_NAME = "YoESP32";     // ESP32 Bluetooth name
+  
+  BluetoothSerial BT_ESP;
+#endif
 #if DEBUG == 1
   #define debug(x) {Serial.print(x); delay(10);}
   #define debugln(x) {Serial.println(x); delay(10);}
@@ -23,8 +25,6 @@ FILTRO PASA BAJAS (EN DERIVADOR) - FEEDBACK LOOP CON INTEGRADOR EN EL FEEDBACK
 #endif
 
 #define BAUDRATE 115200
-#define BAUDRATE_GPS 9600
-#define PI 3.141592
 #define LORA_FREQ 433E6
 
 #define LORA_SCK 32
@@ -34,52 +34,52 @@ FILTRO PASA BAJAS (EN DERIVADOR) - FEEDBACK LOOP CON INTEGRADOR EN EL FEEDBACK
 #define LORA_RST 27
 #define LORA_DI0 4
 
-#define ECHO_PIN 23
-#define TRIGGER_PIN 22
-#define SV_PITCH_PIN 21
-#define SV_ROLL_PIN 19
-#define SDA_PIN 17
-#define SCL_PIN 16
-// #define BUZ_PIN 4
-#define LED_PIN 2
+#define PIN_VOLTAGE 23
+#define PIN_CURRENT 22
+#define PIN_SV_PITCH 21
+#define PIN_SV_ROLL 19
+#define PIN_SDA 17
+#define PIN_SCL 16
+#define PIN_BUZ 15
+#define PIN_LED 2
 
 /* ----- CONSTANT VARIABLES ----- */
 struct cVar {
-  /* Ultrasonic sensor */
-  static constexpr uint8_t TEMPERATURE_LOCAL = 20;
+  /* BMP sensor */
+  static constexpr uint16_t BMP_CALIBRATION_VALUES = 50;
 
   /* Final approach with ultrasonic sensor */
   static constexpr uint8_t PITCH_MAX = 30;
-  static constexpr uint16_t ALTITUDE_THRESHOLD = 40;    // NEEDS TO BE ADJUSTED
+  static constexpr uint16_t ALTITUDE_THRESHOLD = 68;
 
   /* Turn control */
-  static constexpr uint8_t TURN_BANK_MAX = 20;
+  static constexpr uint8_t TURN_BANK_MAX = 30;
   static constexpr uint8_t TURN_PITCH_MAX = 15;
 
   /* Attitude control */
-  static constexpr uint8_t SV_CENTER_ROLL = 90;
-  static constexpr uint8_t SV_CENTER_PITCH = 92;
+  static constexpr uint8_t SV_CENTER = 90;
   // static constexpr uint16_t ALTITUDE_REF = 2000;
 };
 
-struct kVar {
-  static constexpr float K_APPROACH_PITCH = 3.5;
-  static constexpr float K_BANK_YAW = 1.5;
-  static constexpr float K_BANK_PITCH = 2.0;
-  static constexpr float K_ROLL = 2.5;
-  static constexpr float K_PITCH = 2.0;
-};
+struct PIDvar {
+  static constexpr uint16_t SETPOINT = 100;
+  static constexpr float INTEGRAL_WINDUP_MIN = -50;
+  static constexpr float INTEGRAL_WINDUP_MAX = 50;
+  static constexpr float DERIVATIVE_LPF_ALPHA = 0.1;
+}; 
 
-// /* Landing point */
-// struct varLanding {
-//   static int32_t longitude;
-//   static int32_t latitude;
-//   static float altitude;
-// };
+/* PID parameters */
+float input = 0.0;
+float output = 0.0;
+float integral = 0.0;
+float errorLast = 0.0;
+unsigned long timeLast = 0;
 
-/* Bluetooth */
-constexpr uint16_t timeInterval = 100;
-constexpr char *ESP_NAME = "YoESP32";     // ESP32 Bluetooth name
+/* Order is Kp, Ki, Kd */
+float PID_STABROLL_VAR[3] = {1.88, 0.1, 0.005};
+float PID_STABPITCH_VAR[3] = {1.8, 0.5, 0.008};
+float PID_TURNROLL_VAR[3] = {1.88, 0.1, 0.005};
+float PID_TURNPITCH_VAR[3] = {1.8, 0.5, 0.008};
 
 /* Mission control */
 /* 0 = Stabilizer (default), 1 = Turning, 2 = Approach*/
@@ -89,66 +89,71 @@ bool isArmed = true;             // Am i armed?
 /* Turn control */
 /* 0 = Stabilizer, 1 = Right, 2 = Left */
 uint8_t isTurn = 0;            // Where am i turning to?
-uint16_t YAW_SETPOINT = 90;
+uint16_t YAW_SETPOINT = 110;
 uint8_t YAW_TOLERANCE = 30;
 
-/* Attitude control */
-// float controlInput = 0.0, controlOutput, controlSetPoint = 90;
-// float Kp = 1; Ki = 0.0001; Kd = 0.0001;
-// PID rollPID(&controlInput, &controlOutput, &controlSetPoint, Kp, Ki, Kd, DIRECT);
+/* Other variables */
+float ALTITUDE_DEFINED;
 
-Adafruit_BMP085 BMP;
-MPU9250 MPU;
 Servo ServoRoll;
 Servo ServoPitch;
-BluetoothSerial BT_ESP;
+Adafruit_BMP085 BMP;
+MPU9250 MPU;
 
+
+
+void ledError(int time = 100) {
+  digitalWrite(PIN_LED, HIGH);
+  delay(time);
+  digitalWrite(PIN_LED, LOW);
+  delay(time);
+}
 
 
 void setup() {
   /* ----- INIT ----- */
   Serial.begin(BAUDRATE);
-  BT_ESP.begin(ESP_NAME);
-  Wire.begin(SDA_PIN, SCL_PIN); delay(10);
+  Wire.begin(PIN_SDA, PIN_SCL); delay(10);
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
   /* LED pin for debugging */
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(PIN_LED, OUTPUT);
 
-  /* Ultrasonic sensor */
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(TRIGGER_PIN, OUTPUT);
+  /* Current and voltage sensors */
+  // pinMode(PIN_VOLTAGE, INPUT);
+  // pinMode(PIN_CURRENT, INPUT);
 
-  /* PID control */
-  // rollPID.SetMode(AUTOMATIC);
+  /* Buzzer */
+  // pinMode(PIN_BUZ, OUTPUT);
 
   /* ----- MODULES INIT ----- */
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DI0); delay(10);
-  if (!LoRa.begin(LORA_FREQ)) {
-    debugln("LoRa init failed");
-    while (1) {
-      ledError();
-    }
-  } else {
-    LoRa.setSpreadingFactor(7);
-    LoRa.setSignalBandwidth(500E3); delay(10);
-  }
 
   if (!MPU.setup(0x68)) {
     debugln("MPU9250 init failed");
     while (1) {
-      ledError();
+      ledError(1000);
     }
   }
 
-  // if (!BMP.begin()) {
-  //   debugln("BMP180 init failed");
-  //   while (1) {
-  //     ledError();
-  //   }
-  // }
+  if (!BMP.begin()) {
+    debugln("BMP180 init failed");
+    while (1) {
+      ledError(2000);
+    }
+  } else {
+    for (int i = 0; i < cVar::BMP_CALIBRATION_VALUES; i++) {
+      ledError();
+      ALTITUDE_DEFINED += BMP.readAltitude();
+    }
+    ALTITUDE_DEFINED /= cVar::BMP_CALIBRATION_VALUES;
+  }
 
-
+  ledError(500);
+  ledError(500);
+  ledError(500);
+  calibration();    // Accel and magnetomer calibration
+  
   /* Timers for ESP32 pwm allocation */
   debugln("Configurating servos and ultrasonic...");
   ESP32PWM::allocateTimer(0);
@@ -158,15 +163,17 @@ void setup() {
 
   /* Adjusting servos */
   ServoRoll.setPeriodHertz(50);
-  ServoRoll.attach(SV_ROLL_PIN, 1000, 2000);
-  ServoRoll.write(cVar::SV_CENTER_ROLL);
+  ServoRoll.attach(PIN_SV_ROLL, 1000, 2000);
+  ServoRoll.write(cVar::SV_CENTER);
 
   ServoPitch.setPeriodHertz(50);
-  ServoPitch.attach(SV_PITCH_PIN, 1000, 2000);
-  ServoPitch.write(cVar::SV_CENTER_ROLL);
+  ServoPitch.attach(PIN_SV_PITCH, 1000, 2000);
+  ServoPitch.write(cVar::SV_CENTER);
 
   
   #if IS_BLUETOOTH == 1
+    BT_ESP.begin(ESP_NAME);
+
     delay(5000);
     BT_ESP.println("Enter desired yaw: ");
     while (true) {
@@ -200,67 +207,97 @@ void setup() {
         }
       }
     }
+  #else 
+    if (!LoRa.begin(LORA_FREQ)) {
+      debugln("LoRa init failed");
+      while (1) {
+        ledError(500);
+      }
+    } else {
+      LoRa.setSpreadingFactor(7);
+      LoRa.setSignalBandwidth(500E3); delay(10);
+    }
   #endif
 
   delay(1000);
 }
 
 
-void ledError() {
-  digitalWrite(LED_PIN, HIGH);
-  delay(500);
-  digitalWrite(LED_PIN, LOW);
-  delay(500);
-}
-
-
 void calibration() {
-  digitalWrite(LED_PIN, HIGH);
-  BT_ESP.println("Calibrating ...");
+  digitalWrite(PIN_LED, HIGH);
+  #if IS_BLUETOOTH == 1
+    BT_ESP.println("Calibrating ...");
+  #else
+    debugln("Calibrating ...");
+  #endif
   
   MPU.verbose(true);
   delay(2000);
 
   MPU.calibrateAccelGyro();
-  BT_ESP.println("Accelerometer calibrated");
+  #if IS_BLUETOOTH == 1
+    BT_ESP.println("Accelerometer calibrated");
+  #else
+    debugln("Accelerometer calibrated");
+  #endif
   delay(2000);
 
   /* LED signal to start magnetometer manual calibration */
   ledError();
   ledError();
   ledError();
-  digitalWrite(LED_PIN, HIGH);
+  digitalWrite(PIN_LED, HIGH);
 
-  BT_ESP.println("Wave device in an figure eight");
+  #if IS_BLUETOOTH == 1
+    BT_ESP.println("Wave device in an figure eight");
+  #else
+    debugln("Wave device in an figure eight");
+  #endif
   MPU.calibrateMag();
-  BT_ESP.println("Magnetometer calibrated");
+  #if IS_BLUETOOTH == 1
+    BT_ESP.println("Magnetometer calibrated");
+  #else
+    debugln("Magnetometer calibrated");
+  #endif
   delay(2000);
 
   MPU.verbose(false);
-  digitalWrite(LED_PIN, LOW);
+  digitalWrite(PIN_LED, LOW);
 }
 
 
-float HCSR04_Measure() {
-  constexpr float SPEED_SOUND = sqrt(1.4 * 286 * (273.15 + cVar::TEMPERATURE_LOCAL));
-  constexpr float SPEED_CONVERSION = (SPEED_SOUND * (100.0/1.0) * (1.0/1000000.0)) / 2;
+float controlPID(float _input, float _setpoint = 0.0, float _Kp = 1.0, float _Ki = 0.0, float _Kd = 0.0) {
+  unsigned long timeActual = millis();
+  
+  float error = _setpoint - _input;
+  float deltaTime = (timeActual - timeLast) / 1000.0;
 
-  digitalWrite(TRIGGER_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIGGER_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIGGER_PIN, LOW);
+  float proportional = _Kp * error;
 
-  uint16_t durationPulse = pulseIn(ECHO_PIN, HIGH);
-  float distanceMeasured = durationPulse * SPEED_CONVERSION;
+  integral += error * deltaTime;
+  integral = constrain(integral, PIDvar::INTEGRAL_WINDUP_MIN, PIDvar::INTEGRAL_WINDUP_MAX);   // ANTIWINDUP
 
-  return distanceMeasured;
+  float derivative = (error - errorLast) / deltaTime;
+  float derivativeFiltered = (PIDvar::DERIVATIVE_LPF_ALPHA * derivative) + ((1 - PIDvar::DERIVATIVE_LPF_ALPHA) * derivativeFiltered);   // LPF
+  
+  float _output = proportional + (_Ki * integral) + (_Kd * derivativeFiltered);
+
+  errorLast = error;
+  timeLast = timeActual;
+
+  return _output;
 }
 
 
-void stabilizer(int _roll, int _pitch, float kRoll = 1.0, float kPitch = 1.0, int angleRoll = 0, int anglePitch = 0) {
-  ServoRoll.write(((_roll - angleRoll) * kRoll * -1) + cVar::SV_CENTER_ROLL);
-  ServoPitch.write(((_pitch - anglePitch) * kPitch * -1) + cVar::SV_CENTER_PITCH);
+void stabilizer(int _roll, int _pitch) {
+  float rollPID = controlPID(-_roll, 0.0, PID_STABROLL_VAR[0], PID_STABROLL_VAR[1], PID_STABROLL_VAR[2]);
+  float pitchPID = controlPID(-_pitch, 2.0, PID_STABPITCH_VAR[0], PID_STABPITCH_VAR[1], PID_STABPITCH_VAR[2]);
+
+  ServoRoll.write(rollPID + cVar::SV_CENTER);
+  ServoPitch.write(pitchPID + cVar::SV_CENTER);
+
+  debug(rollPID); debug(",");
+  debugln(pitchPID);
 }
 
 
@@ -272,34 +309,65 @@ void controlTurning(int _roll, int _pitch, int _yaw_turn) {
   */
   int16_t _yaw_turn_bank = (_yaw_turn < -180) ? (_yaw_turn + 360) : _yaw_turn;
   isTurn = (_yaw_turn_bank < 0) ? 1 : 2;      // 0 = Stabilizer, 1 = Right, 2 = Left
-  Serial.print(isTurn);
-  Serial.print("\t");
-  Serial.println(_yaw_turn_bank);
 
   if (isTurn == 1) {
-    stabilizer(_roll, _pitch, kVar::K_BANK_YAW, kVar::K_BANK_PITCH, cVar::TURN_BANK_MAX * -1, cVar::TURN_PITCH_MAX);
+    float rollPID = controlPID(-_roll, 20.0, PID_TURNROLL_VAR[0], PID_TURNROLL_VAR[1], PID_TURNROLL_VAR[2]);
+    float pitchPID = controlPID(-_pitch, -15.0, PID_TURNPITCH_VAR[0], PID_TURNPITCH_VAR[1], PID_TURNPITCH_VAR[2]);
+    ServoRoll.write(rollPID + cVar::SV_CENTER);
+    ServoPitch.write(pitchPID + cVar::SV_CENTER);
   } else {
-    stabilizer(_roll, _pitch, kVar::K_BANK_YAW, kVar::K_BANK_PITCH, cVar::TURN_BANK_MAX, cVar::TURN_PITCH_MAX);
+    float rollPID = controlPID(-_roll, -20.0, PID_TURNROLL_VAR[0], PID_TURNROLL_VAR[1], PID_TURNROLL_VAR[2]);
+    float pitchPID = controlPID(-_pitch, -15.0, PID_TURNPITCH_VAR[0], PID_TURNPITCH_VAR[1], PID_TURNPITCH_VAR[2]);
+    ServoRoll.write(rollPID + cVar::SV_CENTER);
+    ServoPitch.write(pitchPID + cVar::SV_CENTER);
   }
 }
 
 
 /* Final approach pitch control */
-void controlApproach(int _roll, float _distanceGround) {
-  int8_t pitchControlled = ((float)(cVar::PITCH_MAX * kVar::K_APPROACH_PITCH) / cVar::ALTITUDE_THRESHOLD) * (cVar::ALTITUDE_THRESHOLD - _distanceGround);
+// void controlApproach(int _roll, float _distanceGround) {
+//   int8_t pitchControlled = ((float)(cVar::PITCH_MAX * kVar::APPROACH_PITCH) / cVar::ALTITUDE_THRESHOLD) * (cVar::ALTITUDE_THRESHOLD - _distanceGround);
 
-  ServoRoll.write((_roll * kVar::K_ROLL * -1) + cVar::SV_CENTER_ROLL);
-  ServoPitch.write(pitchControlled + cVar::SV_CENTER_PITCH);
-} 
+//   ServoRoll.write((_roll * kVar::ROLL * -1) + cVar::SV_CENTER);
+//   // ServoPitch.write(pitchControlled + cVar::SV_CENTER);
+// } 
 
 /* -------------------------------------------------- */
 
 void loop() {
   if (MPU.update()) {
     int16_t roll, pitch, yaw;
+    // float current, voltage;
     static uint32_t timePrevious = millis();
 
+    if (Serial.available() > 0) {
+      int PIDvalue = Serial.parseInt();
+      if (Serial.read() == '\r') {}   // To stop blocking (just numbers)
+      
+      if (PIDvalue == 1) {
+        Serial.println("Kp");
+        while (1) {
+          int value = Serial.parseFloat();
+          PID_STABROLL_VAR[0] = value;
+          break;
+        }
+      } else if (PIDvalue == 2) {
+        while (1) {
+          int value = Serial.parseFloat();
+          PID_STABROLL_VAR[1] = value;
+          break;
+        }
+      } else if (PIDvalue == 3) {
+        while (1) {
+          int value = Serial.parseFloat();
+          PID_STABROLL_VAR[2] = value;
+          break;
+        }
+      }
+    }
+
     if (millis() > timePrevious + 25) {
+      /* ----- ATTITUDE CONTROL ----- */
       /* Quaternions use and calculation */
       float qw = MPU.getQuaternionW(), qx = MPU.getQuaternionX(), qy = MPU.getQuaternionY(), qz = MPU.getQuaternionZ();
       float _roll_atan1 = 2 * ((qw*qx) + (qy*qz));
@@ -312,39 +380,47 @@ void loop() {
       // pitch = MPU.getPitch();
       // yaw = MPU.getYaw();
       
-      roll = atan2(_roll_atan1, _roll_atan2) * 180/PI;
-      pitch = asin(2 * ((qw*qy) - (qx*qz))) * 180/PI;
-      yaw = atan2(_yaw_atan1, _yaw_atan2) * 180/PI;
-      yaw = (yaw < 0) ? (yaw + 360) : yaw;
+      roll = degrees(atan2(_roll_atan1, _roll_atan2));
+      pitch = degrees(asin(2 * ((qw*qy) - (qx*qz))));
+      yaw = degrees(atan2(_yaw_atan1, _yaw_atan2));
+      yaw = (yaw < 0) ? (yaw + 360) : yaw;    // Yaw between 0 and 360
 
       int16_t yaw_turn = YAW_SETPOINT - yaw;
-      float distanceGround = HCSR04_Measure();
+
+
+      /* ----- OTHER CALCULATIONS ----- */
+      // float distanceGround = HCSR04_Measure();
+      // current = analogRead(PIN_CURRENT);
+      // voltage = analogRead(PIN_VOLTAGE);
+      float altitude = BMP.readAltitude();
+      float temperature = BMP.readTemperature();
+      float ALTITUDE_HEIGHT = altitude - ALTITUDE_DEFINED;
+
 
       /* ----- MISSIONS ----- */
       /* 0 = Stabilizer, 1 = Turning, 2 = Approaching */
       isMission = (abs(yaw_turn) > YAW_TOLERANCE) ? 1 : 0;     // Turning detection
-      isMission = (distanceGround < cVar::ALTITUDE_THRESHOLD) ? 2 : isMission;    // Approach mission is prioritized over turning
+      // isMission = (distanceGround < cVar::ALTITUDE_THRESHOLD) ? 2 : isMission;    // Approach mission is prioritized over turning
 
 
       if (isArmed) {
         switch (isMission) {
           case 1:
             controlTurning(roll, pitch, yaw_turn);
-            digitalWrite(LED_PIN, LOW);
+            digitalWrite(PIN_LED, LOW);
+            // analogWrite(PIN_BUZ, 0);
             break;
 
-          case 2:
-            controlApproach(roll, distanceGround);
-            digitalWrite(LED_PIN, LOW);
-            break;
+          // case 2:
+          //   controlApproach(roll, distanceGround);
+          //   digitalWrite(PIN_LED, LOW);
+          //   analogWrite(PIN_BUZ, 0);
+          //   break;
 
           default:
-            // controlInput = roll;
-            // rollPID.compute();
-            // stabilizer(controlOutput, pitch);
-
-            stabilizer(roll, pitch, kVar::K_ROLL, kVar::K_PITCH);
-            digitalWrite(LED_PIN, HIGH);
+            stabilizer(roll, pitch);
+            digitalWrite(PIN_LED, HIGH);
+            // analogWrite(PIN_BUZ, 255);
             isTurn = 0;
             break;
         }
@@ -355,26 +431,14 @@ void loop() {
       // debug(roll); debug(",");
       // debug(pitch); debug(",");
       // debug(yaw); debug(",");
-      // debug(distanceGround); debug(",");
       // debugln(isMission);
 
-      // controlTurning(roll, yaw_turn);
-      // controlApproach(roll, distanceGround);
-
-      // ServoRoll.write((roll * kVar::K_ROLL * -1) + cVar::SV_CENTER_ROLL);
-      // ServoPitch.write((pitch * kVar::K_PITCH * -1) + cVar::SV_CENTER_PITCH);
-
-
-      // float temperature = BMP.readTemperature();
-      // float altitude = BMP.readAltitude();
-      
       String dataPacket = String(roll) + String(",") + String(pitch) + String(",") + String(yaw) + String(",") + 
-                          String(distanceGround) + String(",") + String(isTurn) + String(",") + String(isMission); 
+                          String(altitude) + String(",") + String(ALTITUDE_HEIGHT) + String(",") + String(temperature) + String(",") + 
+                          String(isTurn) + String(",") + String(isMission);
 
 
       /* ----- COMMUNICATION ----- */
-      // Serial.println(dataPacket);
-
       #if IS_BLUETOOTH == 1
         static uint32_t timePrevious_BT = millis();
         if (millis() > timePrevious_BT + timeInterval) {
@@ -400,12 +464,14 @@ void loop() {
               break;
           }
         }
-      #endif
+      #else
+        debugln(dataPacket);
 
-      /* Sending data */
-      LoRa.beginPacket();
-      LoRa.print(dataPacket);
-      LoRa.endPacket();
+        /* Sending data */
+        LoRa.beginPacket();
+        LoRa.print(dataPacket);
+        LoRa.endPacket();
+      #endif
 
       timePrevious = millis();
     }
