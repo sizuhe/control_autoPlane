@@ -4,9 +4,16 @@
 #include <Adafruit_BMP085.h>
 #include "MPU9250.h"
 
-#define IS_BLUETOOTH 0
 #define DEBUG 0
+#define IS_BLUETOOTH 0
 
+#if DEBUG == 1
+  #define debug(x) {Serial.print(x); delay(10);}
+  #define debugln(x) {Serial.println(x); delay(10);}
+#else
+  #define debug(x)
+  #define debugln(x)
+#endif
 #if IS_BLUETOOTH == 1
   #include "BluetoothSerial.h"
 
@@ -15,13 +22,6 @@
   constexpr char *ESP_NAME = "YoESP32";     // ESP32 Bluetooth name
   
   BluetoothSerial BT_ESP;
-#endif
-#if DEBUG == 1
-  #define debug(x) {Serial.print(x); delay(10);}
-  #define debugln(x) {Serial.println(x); delay(10);}
-#else
-  #define debug(x)
-  #define debugln(x)
 #endif
 
 #define BAUDRATE 115200
@@ -34,13 +34,13 @@
 #define LORA_RST 27
 #define LORA_DI0 4
 
-#define PIN_VOLTAGE 23
-#define PIN_CURRENT 22
+// #define PIN_VOLTAGE 23
+// #define PIN_CURRENT 22
 #define PIN_SV_PITCH 21
 #define PIN_SV_ROLL 19
 #define PIN_SDA 17
 #define PIN_SCL 16
-#define PIN_BUZ 15
+// #define PIN_BUZ 15
 #define PIN_LED 2
 
 /* ----- CONSTANT VARIABLES ----- */
